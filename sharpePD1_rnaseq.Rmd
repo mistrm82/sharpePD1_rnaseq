@@ -1,0 +1,405 @@
+---
+title: "Sharpe lab - PD1 Deletion RNA-Seq"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_depth: 4
+    fig_caption: true
+    fig_width: 7
+    fig_height: 6
+author: "Meeta Mistry"
+---
+
+```{r setup, echo=FALSE}
+ 
+# Setup report details
+clientname="Vikram Juneja"
+clientemail="vikram.juneja@gmail.com "
+lablocation="Sharpe Lab- HMS" 
+analystname="Meeta Mistry"
+analystemail="mmistry@hsph.harvard.edu"
+```
+
+RNA-Seq analysis for `r clientname` (`r clientemail`) at `r lablocation`. Contact `r analystname` (`r analystemail`) for additional details. Request from client was:     
+
+Using an inducible Cre-lox system (with PD1 floxed mice), two groups of mice were generated: 1) with active Cre expression and 2) without Cre expression. All samples are from day 7 deletion (Tamoxifen induced) and are sorted on day 15 (CD8 cells).
+
+
+## Setup
+### Bioconductor and R libraries used
+
+```{r libraries, echo=TRUE}
+loadlibs <- function(){
+library(ggplot2)
+library(reshape)
+library(gplots)
+library(pheatmap)
+library(RColorBrewer)
+library(CHBUtils)
+library(ggdendro)
+library(grid)
+library(gridExtra)
+library(DESeq2)
+library(Biobase)
+library(genefilter)
+library(CHBUtils)
+library(gProfileR)
+source('revigo.R') ## for GO analysis
+}
+suppressPackageStartupMessages(loadlibs())
+```
+
+### Set variables
+```{r directories, echo=TRUE}
+baseDir=getwd()
+dataDir=paste(baseDir, "/data", sep="")
+resultsDir=paste(baseDir, "/results", sep="")
+metaDir=paste(baseDir, "/meta", sep="")
+
+heatcolors.1 <- rev(brewer.pal(6, "YlOrRd"))
+heatcolors.2 <- colorRampPalette(brewer.pal(9, "GnBu"))(100)
+cbPalette <- cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", 
+                            "#D55E00", "#CC79A7", "#000000")
+```
+
+## RNA-Seq
+### Load data
+
+```{r loadcounts}
+data <- read.delim(file.path(dataDir, 'combined.counts'), header=T, sep="\t", row.names=1, as.is=T)
+annot <- read.delim(file.path(dataDir, 'annotated_combined.counts'), header=T, sep="\t", row.names=1)
+# Change column names to match metadata
+cols <- sapply(colnames(data), function(x){strsplit(x, split=".", fixed=T)[[1]][1]}, USE.NAMES=F)
+colnames(data) <- cols
+
+meta <- read.delim(file.path(metaDir, 'sharpePD1_project.csv'), header=T, sep=",", row.names=1)
+# Change column names to match data
+rows <- sapply(rownames(meta), function(x){strsplit(x, split=".", fixed=T)[[1]][1]}, USE.NAMES=F)
+row.names(meta) <- rows
+# Re-order meta
+meta <- meta[colnames(data),]
+```
+
+
+### Filter data 
+There are a very low number of genes identified per sample (~7k or lower), but the genes that are being detected vary across samples. If we filter the matrix to remove genes that have zero counts across the board, we are still left with ~15k genes. We can also remove the entire Cre-PD1- samplegroup since they all have quite a low number of reads (< 2million). The quality report outlining this can be found [here](./summary/qc-summary.html)
+
+```{r filter}
+
+# Filter out zero count genes
+rowsums <- rowSums(data)
+data <- data[which(rowsums > 0),]
+
+remove <- which(meta$samplegroup == "Creneg_PD1neg")
+#remove <- c(remove, which(row.names(meta) =="TILs06_Cre_neg_PD1_pos_1"))
+fulldata <- data # store for later
+fullmeta <- meta # store for later
+data <- data[,-remove]
+meta <- meta[-remove,]
+
+# Create eset object
+eset <- new("ExpressionSet", exprs=as.matrix(data))
+pData(eset) <- meta
+# annot <- read.delim(file.path(dataDir, 'annotated_combined.counts'), sep="\t", header=T, row.names=1)
+# fData(eset) <- data.frame(symbol=annot$symbol, row.names=row.names(annot), stringsAsFactors = FALSE)
+
+```
+
+### DESeq2
+We can visualize the transformed values for the new filtered count matrix. For certain comparison analysis using unsupervised techniques, it is useful to transform data. These techniques (i.e. PCA and clustering) perform better when values have a similar dynamic range. Transformation renders data homoskedastic (variance of gene is stabilized across all expression levels), which you don't see with a simple log2 transform. Here, we use the rlog transform which takes into account gene-wise dispersion estimates and size factors (since the coverage varies quite a bit across samples). 
+
+From both PCA and clustering, the dLN samples group (lymph node cells) appear to cluster well together while segregration of the other sample groups is not as clear. There is some clustering for the majority of the Cre+PD1- samples but for the other two groups (Cre+PD1+, Cre-PD1+) the samples are dispersed amongst each other. 
+
+During the model fitting we get a warninig message which states `3417 genes were 'replaced'`. When there are 7 or more replicates for a given sample, the DESeq function will automatically _replace counts with large Cook’s distance_ with the trimmed mean over all samples, scaled up by the size factor or normalization factor for that sample. Cook’s distance is a measure of how much a single sample is influencing the fitted coefficients for a gene, and a large value of Cook’s distance is intended to indicate an outlier count. The automatic outlier replacement is useful for limited replacement, but this number of outliers indicates that you might need to do more manual inspection of the dataset. There is a single outlier in the Cre-PD1+ group (TILs06_Cre_neg_PD1_pos_1), which is most obvious from the full dataset PCA.
+
+```{r qcseq, echo=FALSE, fig.align='center', warning=FALSE, message=FALSE}
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = exprs(eset), colData = pData(eset), design = ~ samplegroup)
+dds <- DESeq(dds, fitType = 'local')
+# dds <- DESeq(dds, fitType = 'local', minReplicatesForReplace=Inf)
+
+# rlog transform of data for visualization
+rld_full <- rlog(dds, blind=TRUE)
+
+# Dendrogram
+  meta.x <- meta
+  transformed_counts <- assay(rld_full)
+  myDist <- dist(t(transformed_counts))
+  myTree <-hclust(myDist)
+  dhc <- as.dendrogram(myTree)
+  ddata <- dendro_data(dhc, type="rectangle")
+  ddata$labels <- merge(ddata$labels, meta.x, by.x="label", by.y="row.names")
+
+ggplot(segment(ddata)) +
+    geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+    theme_dendro() +
+    geom_text(data=label(ddata), aes(x=x, y=y, label=label, color= label(ddata)[['samplegroup']], 
+                                     hjust=-0.1), size=4) +
+    coord_flip() + scale_y_reverse(expand=c(0.2, 50)) +
+    theme(axis.text.x=element_blank(),
+          axis.text.y=element_blank(),
+          axis.title.x=element_blank(),
+          axis.title.y=element_blank(),
+          legend.title=element_blank())
+
+```
+
+
+With the PCA, only the top 500 most variable genes are used. PCA is a linear transformation that is intended to capture the greatest variability between samples. So using the 500 most variable genes we will observe a larger effect on the result than the next
+500 genes, etc. 
+
+```{r pca}
+
+# PCA plot of first and second PCs
+plotPCA(rld_full, intgroup="samplegroup")
+pca_full <- plotPCA(rld_full, intgroup="samplegroup", returnData=TRUE)
+```
+
+From the screeplot below (and labeling on the axis above) we see that PC1 explains the most variance (27%) whcih is quite low. And the subsequent PCs explaining even less. For PC1 we can identify the genes we can then use the loadings and find the top 50 genes that most affect it. 
+
+
+```{r pca-genes, results='asis', fig.align='center'}
+
+# PCA
+ntop <- 500
+rv <- rowVars(assay(rld_full))
+select <- order(rv, decreasing=TRUE)[seq_len(ntop)]
+pca <- prcomp(t(assay(rld_full)[select,]))
+screeplot(pca, main="Screeplot of Explained Variance")
+
+# Find genes associated with PC1 and PC2
+loadings <- pca$rotation
+select <- order(abs(loadings[,1]), decreasing = TRUE)[seq_len(50)]
+pc1.ens <- row.names(loadings)[select]
+pc1.genes <- annot$symbol[match(pc1.ens, row.names(annot))]
+kable(head(cbind(pc1.ens, as.character(pc1.genes))))
+```
+
+
+### Filtering data
+Since we are only interested in the main comparison of Cre+PD1+ versus Cre+PD1-, we can remove the other samples and see if that reduces the number of outlier genes. Again we get `replacing outliers and refitting for 2496 genes`, which is still quite high. From the PCA, we find there are two major outliers in the Cre+PD1- group. After removal of those two samples we no longer get replacement.
+
+```{r qcoutlier, fig.align='center', warning=FALSE, message=FALSE}
+
+# Remove irrelevant sample groups
+remove <- which(pData(eset)$samplegroup == "dlN" | pData(eset)$samplegroup == "Creneg_PD1pos")
+
+# Remove outlier
+eset_compare <- eset[,-remove]
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = exprs(eset_compare), colData = pData(eset_compare), design = ~ samplegroup)
+dds <- DESeq(dds, fitType = 'local')
+
+# rlog transform of data for visualization
+rld <- rlog(dds, blind=TRUE)
+
+# PCA plot of first and second PCs
+plotPCA(rld, intgroup="samplegroup")
+pca <- plotPCA(rld, intgroup="samplegroup", returnData=TRUE)
+
+# Remove outliers
+outliers <- c(which.max(pca$PC2), which.min(pca$PC2))
+eset_compare <- eset_compare[,-outliers]
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = exprs(eset_compare), colData = pData(eset_compare), design = ~ samplegroup)
+dds <- DESeq(dds, fitType = 'local')
+```
+
+```{r pca-genes-2, echo=FALSE, eval=FALSE}
+
+# PCA
+ntop <- 500
+rv <- rowVars(assay(rld))
+select <- order(rv, decreasing=TRUE)[seq_len(ntop)]
+pca <- prcomp(t(assay(rld)[select,]))
+
+# Find genes associated with PC1 and PC2
+loadings <- pca$rotation
+select <- order(abs(loadings[,1]), decreasing = TRUE)[seq_len(50)]
+pc1.ens <- row.names(loadings)[select]
+pc1.genes <- annot$symbol[match(pc1.ens, row.names(annot))]
+select <- order(abs(loadings[,2]), decreasing = TRUE)[seq_len(50)]
+pc2.ens <- row.names(loadings)[select]
+pc2.genes <- annot$symbol[match(pc2.ens, row.names(annot))]
+
+```
+
+
+## DESeq2: 
+## Finding genes differentially expressed between Cre+PD1+ and Cre+PD1-
+
+This is the main comparison where we hope to find gene expression changes. At an adjusted p-value of 0.1 there are 68 genes that are differentially expressed between the two groups. A summary is provided below:
+
+```{r summary}
+
+# Extract data of specified contrasts
+# resultNames(dds) # uncomment to check names for contrast setup
+contrast <- list("samplegroupCrepos_PD1neg", "samplegroupCrepos_PD1pos" )
+res1 <- results(dds, contrast=contrast)
+
+summary(res1)
+```
+
+The low mean count threshold is set at 134.2 and so anything below that is filtered out (the adjusted p-value is set to NA and not considered for multiple testing). Since we have low counts in the experiment it's not surprising that there is such a large proportion (82%) getting filtered. The goal of this is to filter out those tests from the procedure that no chance of showing significant evidence, without even looking at their test statistic. Typically, this results in increased detection power at the same experiment-wide FPR. What happens if we remove it? We get fewer significant genes.
+
+```{r remove-filtering}
+
+res_nofilter <- results(dds, contrast=contrast, independentFiltering = FALSE)
+summary(res_nofilter)
+```
+
+
+### Dispersion
+The dispersion plot is dispalyed below. The curve goes up and then down, usually you expect it to decrease as a function of mean normalized counts. Low counts genes have high dispersion; majority of our genes are low counts due to low number of reads. Some experiments can have different relationship of dispersion over mean, which is why we use the 'local' fit. The methods are still valid with the local fit.
+
+```{r dispersion, echo=FALSE, fig.align='center'}
+plotDispEsts(dds)
+```
+
+### MA Plot
+
+It looks like the beta prior distribution (by "beta" we mean log fold change) is so wide that there is not as much shrinkage as in other experiments. The beta prior is estimated from the observed differences between conditions across all genes, so if there are many large differences here, there is less shrinkage. So this is expected.
+
+```{r ma-plot, echo=FALSE, fig.align='center'}
+
+# significant genes are mostly small fold changes
+plotMA(res1)
+
+# plot(res1$baseMean+1, -log10(res1$pvalue),
+# log="x", xlab="mean of normalized counts",
+# ylab=expression(-log[10](pvalue)),
+# ylim=c(0,30),
+# cex=.4, col=rgb(0,0,0,.3))
+```
+
+
+### Heatmap of significant genes
+
+```{r heatmap, fig.align='center'}
+
+# rlog transform of data for visualization
+rld <- rlog(dds, blind=TRUE)
+
+# Significant genes
+p.cutoff <- 0.1
+res1$threshold <- as.logical(res1$padj < p.cutoff)
+
+# Get expression data for significant genes
+transformed_data <- assay(rld)
+transformed_data <- transformed_data[row.names(res1)[which(res1$threshold)],]
+
+annotation <- data.frame(sampletype=pData(eset_compare)[,'samplegroup'], row.names=row.names(pData(eset_compare)))
+pheatmap(transformed_data, color = heatcolors.1, cluster_rows = T, 
+         annotation=annotation, border_color=NA, show_rownames = F,
+         cluster_cols = T, show_colnames = T, clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         fontsize = 10, fontsize_row = 8, height=20)
+```
+
+### Heatmap in full dataset
+
+```{r heatmap-full, fig.align='center'}
+
+# Get expression data for significant genes
+transformed_data <- assay(rld_full)
+transformed_data <- transformed_data[row.names(res1)[which(res1$threshold)],]
+
+annotation <- data.frame(sampletype=meta[,'samplegroup'], row.names=row.names(meta))
+pheatmap(transformed_data, color = heatcolors.1, cluster_rows = T, 
+         annotation=annotation, border_color=NA, show_rownames = F,
+         cluster_cols = T, show_colnames = T, clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         fontsize = 10, fontsize_row = 8, height=20)
+```
+
+```{r heatmap-all, echo=FALSE, eval=FALSE, fig.align='center'}
+
+# Get rld values for full dataset
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = fulldata, colData = fullmeta, design = ~ samplegroup)
+dds <- DESeq(dds, fitType = 'local')
+
+# rlog transform of data for visualization
+rld_all <- rlog(dds, blind=TRUE)
+
+# Get expression data for significant genes
+transformed_data <- assay(rld_all)
+transformed_data <- transformed_data[row.names(res1)[which(res1$threshold)],]
+
+annotation <- data.frame(sampletype=fullmeta[,'samplegroup'], row.names=row.names(fullmeta))
+pheatmap(transformed_data, color = heatcolors.1, cluster_rows = T, 
+         annotation=annotation, border_color=NA, show_rownames = F,
+         cluster_cols = T, show_colnames = T, clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         fontsize = 10, fontsize_row = 8, height=20)
+```
+
+### GO Analysis
+We used the 68 genes as input to [gProfileR](http://biit.cs.ut.ee/gprofiler/), a tool that performs statistical enrichment analysis to find over-representation of information like Gene Ontology terms, biological pathways, regulatory DNA elements, human disease gene annotations, and protein-protein interaction networks. From the gprofiler results the significant Gene Ontolgy terms were extracted and some of the top terms are highlighted in the table below:
+
+```{r gprofiler, echo=FALSE, results='asis'}
+sig.genes <- row.names(res1)[which(res1$threshold)]
+
+gene.names <- annot$symbol[which(row.names(annot) %in% sig.genes)]
+query <- unique(as.character(gene.names))
+  
+gprofiler_results  <- gprofiler(query = query, 
+            organism = "mmusculus",
+            ordered_query = F, 
+            exclude_iea = F, 
+            max_p_value = 0.05, 
+            max_set_size = 0,
+            correction_method = "fdr",
+            hier_filtering = "none", 
+            domain_size = "annotated",
+            custom_bg = "")
+
+allterms <- gprofiler_results$term.id
+go_table <- gprofiler_results[grep('GO:', allterms) ,
+                              c("term.id", "term.name", "p.value", "overlap.size", "precision","recall")]
+kable(head(go_table[order(go_table$p.value),], 10), format='markdown', row.names=F)
+```
+
+These terms were used as input to [REVIGO](http://revigo.irb.hr/) to visualize the most prominent processes and reduce redundancy of terms. Each rectangle is a single cluster representative, where terms sharing parent term at some level have been grouped together. The representatives are joined into ‘superclusters’ of loosely related terms, visualized with different colors. Size of the text reflect either the p-value, or the frequency of the GO term in the underlying GOA database. 
+
+```{r GO-analysis, echo=FALSE, fig.align='center'}
+
+GOs <- allterms[grep('GO:', allterms)]
+pvals <- gprofiler_results$p.value[grep('GO:', allterms)]
+runRevigo(GOs, pvals)
+```
+
+## Files for download
+
+* [Full count data matrix](./annotated_combined.counts)
+* [Full FPKM matrix](./data/annotated_combined.fpkm)
+* [Full results table from DESeq2](./results/CreposPDpos_vs_CreposPDneg_deseq2_full.txt)
+* [Significant gene results from DESeq2](./results/CreposPDpos_vs_CreposPDneg_deseq2.txt)
+* [FPKM matrix for significant genes](./results/CreposPDpos_vs_CreposPDneg_fpkm.txt)
+* [gProfiler results](./results/CreposPDpos_vs_CreposPDneg_gprofiler.txt)
+
+```{r write-res, eval=FALSE, echo=FALSE}
+
+# Results data
+out <- as.matrix(res1)
+out <- out[which(row.names(res1) %in% sig.genes),]
+m <- match(row.names(out), row.names(annot))
+out <- cbind(as.character(annot$symbol[m]), out)
+
+# Expression data
+fpkm <- read.delim(file.path(dataDir, 'combined.fpkm'), sep="\t", header=T, row.names=1)
+sub.fpkm <- fpkm[which(row.names(fpkm) %in% sig.genes), names(data)]
+m <- match(row.names(sub.fpkm), row.names(annot))
+out <- cbind(as.character(annot$symbol[m]), sub.fpkm)
+
+# gProfiler data
+write.table(gprofiler_results[,c("term.id", "term.name", "term.size", "domain", "overlap.size", "p.value", 
+                                 "precision","recall", "intersection")], 
+                                 file="CreposPDpos_vs_CreposPDneg_gprofiler.txt", sep="\t", row.names=F, quote=F)
+
+```
+
